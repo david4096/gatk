@@ -15,7 +15,7 @@ import org.broadinstitute.hellbender.engine.filters.ReadFilter;
 import org.broadinstitute.hellbender.engine.filters.ReadFilterLibrary;
 import org.broadinstitute.hellbender.exceptions.GATKException;
 import org.broadinstitute.hellbender.exceptions.UserException;
-import org.broadinstitute.hellbender.tools.spark.sv.utils.SVInterval;
+import org.broadinstitute.hellbender.utils.CollatingInterval;
 import org.broadinstitute.hellbender.utils.Nucleotide;
 import org.broadinstitute.hellbender.utils.io.BlockCompressedIntervalStream;
 import org.broadinstitute.hellbender.utils.read.GATKRead;
@@ -506,23 +506,8 @@ public class PairedEndAndSplitReadEvidenceCollection extends ReadWalker {
                               final int minMapQ,
                               final int minQ ) {
             this.dict = dict;
-            this.writer =
-                    new BlockCompressedIntervalStream.Writer<>(new GATKPath(outputFilename), dict,
-                            (locusDepth, dos) -> {
-                        try {
-                            dos.writeInt(locusDepth.getContigId());
-                            dos.writeInt(locusDepth.getPosition());
-                            dos.writeByte(locusDepth.getRefIdx());
-                            dos.writeByte(locusDepth.getAltIdx());
-                            dos.writeInt(locusDepth.getTotalDepth());
-                            dos.writeInt(locusDepth.getAltDepth());
-                        } catch ( final IOException ioe ) {
-                            throw new UserException("unable to write to " + outputFilename);
-                        }
-                        return new SVInterval(locusDepth.getContigId(),
-                                              locusDepth.getPosition(),
-                                              locusDepth.getPosition() + 1);
-                            });
+            this.writer = new BlockCompressedIntervalStream.Writer<>(new GATKPath(outputFilename),
+                    dict, LocusDepth.class, LocusDepth.BCI_VERSION, LocusDepth::write);
             this.minMapQ = minMapQ;
             this.minQ = minQ;
             final FeatureDataSource<VariantContext> snpSource =
@@ -530,7 +515,7 @@ public class PairedEndAndSplitReadEvidenceCollection extends ReadWalker {
             dict.assertSameDictionary(snpSource.getSequenceDictionary());
             this.snpSourceItr = snpSource.iterator();
             this.locusDepthQueue = new ArrayDeque<>(100);
-            readLocus();
+            readNextLocus();
         }
 
         public void apply( final GATKRead read ) {
@@ -539,12 +524,11 @@ public class PairedEndAndSplitReadEvidenceCollection extends ReadWalker {
             }
 
             // clean queue of LocusCounts that precede the current read
-            final int contigId = dict.getSequenceIndex(read.getContig());
-            final Locus readStart = new Locus(contigId, read.getStart());
-            while ( locusDepthQueue.getFirst().compareTo(readStart) < 0 ) {
+            final CollatingInterval readInterval = new CollatingInterval(dict, read);
+            while ( locusDepthQueue.getFirst().compareTo(readInterval) < 0 ) {
                 writer.write(locusDepthQueue.removeFirst());
                 if ( locusDepthQueue.isEmpty() ) {
-                    if ( !readLocus() ) {
+                    if ( !readNextLocus() ) {
                         return;
                     }
                 }
@@ -552,18 +536,17 @@ public class PairedEndAndSplitReadEvidenceCollection extends ReadWalker {
 
             // make sure that the last LocusCount in the queue happens after the current read
             //  if such a LocusCount is available
-            final Locus readEnd = new Locus(contigId, read.getEnd());
-            while ( readEnd.compareTo(locusDepthQueue.getLast()) > 0 ) {
-                if ( !readLocus() ) {
+            while ( !readInterval.isUpstreamOf(locusDepthQueue.getLast()) ) {
+                if ( !readNextLocus() ) {
                     break;
                 }
             }
 
-            walkReadMatches(read, contigId);
+            walkReadMatches(read);
         }
 
-        public void walkReadMatches( final GATKRead read, final int contigId ) {
-            Locus opStart = new Locus(contigId, read.getStart());
+        public void walkReadMatches( final GATKRead read ) {
+            int opStart = read.getStart();
             int readIdx = 0;
             final byte[] calls = read.getBasesNoCopy();
             final byte[] quals = read.getBaseQualitiesNoCopy();
@@ -571,16 +554,16 @@ public class PairedEndAndSplitReadEvidenceCollection extends ReadWalker {
                 final int eleLen = cigEle.getLength();
                 final CigarOperator cigOp = cigEle.getOperator();
                 if ( cigOp.isAlignment() ) {
-                    final Locus opEnd =
-                            new Locus(opStart.getContigId(), opStart.getPosition() + eleLen);
+                    final int opEnd = opStart + eleLen - 1;
+                    final CollatingInterval opInterval =
+                            new CollatingInterval(dict, read.getContig(), opStart, opEnd);
                     for ( final LocusDepth locusDepth : locusDepthQueue ) {
-                        if ( locusDepth.compareTo(opEnd) >= 0 ) {
+                        if ( opInterval.isUpstreamOf(locusDepth) ) {
                             break;
                         }
-                        if ( opStart.compareTo(locusDepth) <= 0 &&
-                                !isBaseInsideAdaptor(read, locusDepth.getPosition()) ) {
-                            final int callIdx =
-                                    readIdx + locusDepth.getPosition() - opStart.getPosition();
+                        if ( opInterval.overlaps(locusDepth) &&
+                                !isBaseInsideAdaptor(read, locusDepth.getStart()) ) {
+                            final int callIdx = readIdx + locusDepth.getStart() - opStart;
                             if ( quals[callIdx] < minQ ) {
                                 continue;
                             }
@@ -592,10 +575,10 @@ public class PairedEndAndSplitReadEvidenceCollection extends ReadWalker {
                     }
                 }
                 if ( cigOp.consumesReadBases() ) {
-                    readIdx += cigEle.getLength();
+                    readIdx += eleLen;
                 }
                 if ( cigOp.consumesReferenceBases() ) {
-                    opStart = new Locus(opStart.getContigId(), opStart.getPosition() + eleLen);
+                    opStart += eleLen;
                 }
             }
         }
@@ -607,7 +590,7 @@ public class PairedEndAndSplitReadEvidenceCollection extends ReadWalker {
             writer.close();
         }
 
-        private boolean readLocus() {
+        private boolean readNextLocus() {
             if ( !snpSourceItr.hasNext() ) {
                 return false;
             }
@@ -618,7 +601,7 @@ public class PairedEndAndSplitReadEvidenceCollection extends ReadWalker {
                 }
                 snp = snpSourceItr.next();
             }
-            final int contigId = dict.getSequenceIndex(snp.getContig());
+            final String contig = snp.getContig();
             final int position = snp.getStart();
             final byte[] refSeq = snp.getReference().getBases();
             final Nucleotide refCall = Nucleotide.decode(refSeq[0]);
@@ -633,54 +616,43 @@ public class PairedEndAndSplitReadEvidenceCollection extends ReadWalker {
                         altCall + " at locus " + snp.getContig() + ":" + position);
             }
             final LocusDepth locusDepth =
-                    new LocusDepth(contigId, position, refCall.ordinal(), altCall.ordinal());
+                    new LocusDepth(dict, contig, position, refCall.ordinal(), altCall.ordinal());
             locusDepthQueue.add(locusDepth);
             return true;
         }
     }
 
     @VisibleForTesting
-    static class Locus implements Comparable<Locus> {
-        private final int contigId;
-        private final int position;
-
-        public Locus( final int contigId, final int position ) {
-            this.contigId = contigId;
-            this.position = position;
-        }
-
-        public int getContigId() { return contigId; }
-        public int getPosition() { return position; }
-
-        @Override public int compareTo( final Locus locus ) {
-            int result = Integer.compare(contigId, locus.contigId);
-            if ( result == 0 ) {
-                result = Integer.compare(position, locus.position);
-            }
-            return result;
-        }
-    }
-
-    @VisibleForTesting
-    public final static class LocusDepth extends Locus {
+    public final static class LocusDepth extends CollatingInterval {
         private final int refIdx;
         private final int altIdx;
         private int totalDepth;
         private int altDepth;
+        public final static String BCI_VERSION = "1.0";
 
-        public LocusDepth( final int contigId, final int position,
-                           final int refIdx, final int altIdx ) {
-            this(contigId, position, refIdx, altIdx, 0, 0);
+        public LocusDepth( final SAMSequenceDictionary dict, final String contig,
+                           final int position, final int refIdx, final int altIdx ) {
+            this(dict, contig, position, refIdx, altIdx, 0, 0);
         }
 
-        public LocusDepth( final int contigId, final int position,
+        public LocusDepth( final SAMSequenceDictionary dict, final String contig,
+                           final int position,
                            final int refIdx, final int altIdx,
                            final int totalDepth, final int altDepth ) {
-            super(contigId, position);
+            super(dict, contig, position, position);
             this.refIdx = refIdx;
             this.altIdx = altIdx;
             this.totalDepth = totalDepth;
             this.altDepth = altDepth;
+        }
+
+        public LocusDepth( final SAMSequenceDictionary dict,
+                           final DataInputStream dis ) throws IOException {
+            super(dict, dis);
+            this.refIdx = dis.readByte();
+            this.altIdx = dis.readByte();
+            this.totalDepth = dis.readInt();
+            this.altDepth = dis.readInt();
         }
 
         public void observe( final int idx ) {
@@ -695,8 +667,17 @@ public class PairedEndAndSplitReadEvidenceCollection extends ReadWalker {
         }
         public int getTotalDepth() { return totalDepth; }
 
+        public LocusDepth write( final DataOutputStream dos ) throws IOException {
+            super.write(dos);
+            dos.writeByte(refIdx);
+            dos.writeByte(altIdx);
+            dos.writeInt(totalDepth);
+            dos.writeInt(altDepth);
+            return this;
+        }
+
         public String toString() {
-            return getContigId() + "\t" + getPosition() + "\t" + "ACGT".charAt(refIdx) + "\t" +
+            return getContig() + "\t" + getStart() + "\t" + "ACGT".charAt(refIdx) + "\t" +
                     "ACGT".charAt(altIdx) + "\t" + totalDepth + "\t" + altDepth;
         }
     }
